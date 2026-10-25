@@ -1,0 +1,132 @@
+# test-workbench_change - new file
+# Requires the tscode release workflow (with dsh_fork_* inputs) on its main branch.
+name: tscode runtime
+
+on:
+  push:
+    branches:
+      - dev
+  workflow_dispatch:
+    inputs:
+      dispatch_tscode:
+        description: 'Trigger the tscode release build with this artifact'
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: tscode-runtime-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PRIMARY_NODE_VERSION: '24.18.0'
+  TSCODE_REPOSITORY: AI-Testing-Workbench/test-workbench-vscode
+  TSCODE_REF: main
+  TSCODE_WORKFLOW: release.yml
+  DSH_TELEMETRY_DISABLED: '1'
+
+jobs:
+  build:
+    name: Pack dsh runtime tarballs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v5.0.0
+        with:
+          dest: ${{ runner.temp }}/setup-pnpm
+
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: ${{ env.PRIMARY_NODE_VERSION }}
+
+      - name: Install (immutable)
+        run: pnpm install --frozen-lockfile
+
+      - name: Build official artifacts
+        run: pnpm run build:official
+
+      - name: Pack dsh / vendor / landlock
+        run: |
+          set -e
+          pnpm run release:pack --family dsh --out dist/tscode/dsh --concurrency 8
+          pnpm run release:pack --family vendor --out dist/tscode/vendor --concurrency 8
+          pnpm --dir native/system run build:ts
+          pnpm --dir native/system/packages/entry pack --pack-destination "$PWD/dist/tscode/landlock"
+
+      - name: Resolve version
+        id: version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Write tarball manifests
+        env:
+          DSH_RUNTIME_VERSION: ${{ steps.version.outputs.version }}
+          DSH_RUNTIME_REF: ${{ github.sha }}
+        run: |
+          node - <<'NODE'
+          const { createHash } = require('node:crypto');
+          const { readdirSync, readFileSync, writeFileSync } = require('node:fs');
+          const { join } = require('node:path');
+          for (const family of ['dsh', 'vendor', 'landlock']) {
+            const directory = join('dist/tscode', family);
+            const packages = readdirSync(directory).filter(name => name.endsWith('.tgz')).sort().map(name => ({
+              tarball: name,
+              sha256: createHash('sha256').update(readFileSync(join(directory, name))).digest('hex')
+            }));
+            writeFileSync(join(directory, 'manifest.json'), JSON.stringify({
+              schemaVersion: 1,
+              version: process.env.DSH_RUNTIME_VERSION,
+              source: { repository: process.env.GITHUB_REPOSITORY, ref: process.env.DSH_RUNTIME_REF },
+              packages
+            }, null, 2) + '\n');
+          }
+          NODE
+
+      - name: Verify packed version
+        env:
+          DSH_RUNTIME_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          VERSION=$(tar -xOzf "dist/tscode/dsh/deepseek-ai-dsh-${DSH_RUNTIME_VERSION}.tgz" package/package.json | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>process.stdout.write(JSON.parse(s).version))")
+          test "$VERSION" = "$DSH_RUNTIME_VERSION"
+
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: dsh-fork-tarballs
+          path: dist/tscode
+          if-no-files-found: error
+          retention-days: 30
+
+  dispatch:
+    name: Trigger tscode build
+    needs: build
+    if: ${{ github.event_name == 'push' || github.event.inputs.dispatch_tscode == 'true' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Dispatch tscode release
+        env:
+          GH_TOKEN: ${{ secrets.TSCODE_DISPATCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::TSCODE_DISPATCH_TOKEN is not configured in the fork repository"
+            exit 1
+          fi
+          gh workflow run "$TSCODE_WORKFLOW" \
+            --repo "$TSCODE_REPOSITORY" \
+            --ref "$TSCODE_REF" \
+            -f platforms=all \
+            -f dsh_fork_repository="$GITHUB_REPOSITORY" \
+            -f dsh_fork_ref="$GITHUB_SHA" \
+            -f dsh_fork_run_id="$GITHUB_RUN_ID" \
+            -f dsh_version="${{ needs.build.outputs.version }}"
+          echo "Dispatched $TSCODE_WORKFLOW on $TSCODE_REPOSITORY@$TSCODE_REF for $GITHUB_REPOSITORY@$GITHUB_SHA (run $GITHUB_RUN_ID)"
