@@ -23,7 +23,7 @@ permissions:
 env:
   PRIMARY_NODE_VERSION: '24.18.0'
   TSCODE_REPOSITORY: AI-Testing-Workbench/test-workbench-vscode
-  TSCODE_REF: main
+  TSCODE_REF: feat/dev-tscode-dsh
   TSCODE_WORKFLOW: release.yml
   DSH_TELEMETRY_DISABLED: '1'
 
